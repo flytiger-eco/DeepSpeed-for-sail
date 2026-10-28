@@ -14,31 +14,28 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: k8s-runner-group-cpu-flytiger
     timeout-minutes: 360
     container:
-      image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
-
-    defaults:
-      run:
-        shell: bash
+      image: ghcr.io/actions/actions-runner:latest
 
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Install build dependencies
-        run: python -m pip install build setuptools wheel ninja
-
-      - name: 编译并安装 deepspeed-kernels
-        working-directory: ${{ runner.temp }}
-        run: |
-          git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git
-          cd deepspeed-kernels
-          pip install -v .
-
-      - name: build DeepSpeed wheel
-        run: |
-          export DS_BUILD_FP_QUANTIZER=0
-          DS_BUILD_OPS=1 python -m build --wheel --no-isolation
+      - name: build DeepSpeed wheel (1 PPU)
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
+          command: |
+            python -m pip install build setuptools wheel ninja
+            git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git /tmp/deepspeed-kernels
+            pip install -v /tmp/deepspeed-kernels
+            export DS_BUILD_FP_QUANTIZER=0
+            DS_BUILD_OPS=1 python -m build --wheel --no-isolation
+          namespace: ppu-sched
+          timeout_minutes: 240
