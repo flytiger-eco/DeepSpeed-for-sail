@@ -36,6 +36,10 @@ jobs:
             git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git /tmp/deepspeed-kernels
             pip install -v /tmp/deepspeed-kernels
             export DS_BUILD_FP_QUANTIZER=0
+            # CUDA 13 is not covered by get_default_compute_capabilities(), which would
+            # otherwise fall back to 6.0;6.1;7.0 -- architectures nvcc 13 no longer
+            # accepts. Pin the arch the PPU board reports instead.
+            export TORCH_CUDA_ARCH_LIST="8.9"
             DS_BUILD_OPS=1 python -m build --wheel --no-isolation
           namespace: ppu-sched
           timeout_minutes: 240
