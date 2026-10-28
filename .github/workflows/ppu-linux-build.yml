@@ -34,7 +34,7 @@ jobs:
           command: |
             wget -O /tmp/nccl-sdk.tar.gz https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
             tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
-            ENVSETUP="$/usr/local/pccl/envsetup.sh"
+            ENVSETUP="/usr/local/pccl/envsetup.sh"
             source "$ENVSETUP"
             export NCCL_HOME
             export NCCL_INCLUDE_DIR="${NCCL_HOME}/include"
