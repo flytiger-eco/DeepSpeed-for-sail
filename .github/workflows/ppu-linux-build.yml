@@ -32,6 +32,13 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
           command: |
+            wget -O /tmp/nccl-sdk.tar.gz https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
+            tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
+            ENVSETUP="$/usr/local/pccl/envsetup.sh"
+            source "$ENVSETUP"
+            export NCCL_HOME
+            export NCCL_INCLUDE_DIR="${NCCL_HOME}/include"
+            export NCCL_LIB_DIR="${NCCL_HOME}/lib"
             python -m pip install build setuptools wheel ninja
             git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git /tmp/deepspeed-kernels
             pip install -v /tmp/deepspeed-kernels
