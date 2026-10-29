@@ -15,9 +15,7 @@ permissions:
 env:
   PPU_IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
   NCCL_SDK_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
-  # cluster-task pods share no volume with the runner, but both see the same
-  # /wl_nas host mount, so it is the hand-off point for the built wheel.
-  WHEEL_NAS_DIR: "/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/wheel"
+  WHEEL_NAS_DIR: "/wl_nas/test_framework/${{ github.run_id }}-${{ github.run_attempt }}/wheel"
 
 jobs:
   build:
@@ -97,10 +95,11 @@ jobs:
           set -euo pipefail
 
           mkdir -p wheelhouse
+          # The NAS hand-off directory is left in place on purpose: it is written by
+          # the Pod user and the runner has no permission to delete it. The run-id
+          # scoped path keeps each run isolated, and lifecycle is managed on the NAS
+          # side rather than here.
           cp "${{ env.WHEEL_NAS_DIR }}"/*.whl wheelhouse/
-          # The NAS copy is only a transfer buffer; the artifact is the durable copy.
-          rm -rf "${{ env.WHEEL_NAS_DIR }}"
-          rmdir "$(dirname "${{ env.WHEEL_NAS_DIR }}")" 2>/dev/null || true
           ls -l wheelhouse
 
       - name: upload DeepSpeed wheel
