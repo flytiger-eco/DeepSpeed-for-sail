@@ -92,6 +92,7 @@ jobs:
           timeout_minutes: 240
 
       - name: collect wheel from shared NAS
+        shell: bash
         run: |
           set -euo pipefail
 
