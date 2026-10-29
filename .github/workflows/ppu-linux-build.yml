@@ -12,10 +12,17 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  PPU_IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
+  NCCL_SDK_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+  # cluster-task pods share no volume with the runner, but both see the same
+  # /wl_nas host mount, so it is the hand-off point for the built wheel.
+  WHEEL_NAS_DIR: "/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/wheel"
+
 jobs:
   build:
     runs-on: k8s-runner-group-cpu-flytiger
-    timeout-minutes: 480
+    timeout-minutes: 300
     container:
       image: ghcr.io/actions/actions-runner:latest
 
@@ -24,23 +31,26 @@ jobs:
         with:
           persist-credentials: false
 
-      # Build and test must stay in one cluster-task step: each step gets a fresh
-      # pod with no shared volume, so a wheel built in one step is gone in the next.
-      - name: build DeepSpeed wheel and run checkin tests (1 PPU)
+      - name: build DeepSpeed wheel (1 PPU)
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           nnodes: 0
-          nproc_per_node: 2
+          nproc_per_node: 1
           node_selector: "board-type=ZW-M890P"
-          image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
+          image: ${{ env.PPU_IMAGE }}
           command: |
             set -eo pipefail
 
-            wget -O /tmp/nccl-sdk.tar.gz https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
+            # Probe the hand-off directory up front: a NAS permission problem must
+            # surface in seconds, not after the multi-hour compile below.
+            mkdir -p "${{ env.WHEEL_NAS_DIR }}"
+            touch "${{ env.WHEEL_NAS_DIR }}/.write-probe"
+            rm -f "${{ env.WHEEL_NAS_DIR }}/.write-probe"
+
+            wget -O /tmp/nccl-sdk.tar.gz "${{ env.NCCL_SDK_URL }}"
             tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
             source /usr/local/pccl/envsetup.sh
 
-            # envsetup.sh is not safe under `set -u`, so enable it only afterwards.
             set -u
             export NCCL_HOME="${NCCL_HOME:?}"
             export NCCL_INCLUDE_DIR="${NCCL_HOME}/include"
@@ -74,7 +84,106 @@ jobs:
             # not cover, so the arch list would otherwise be filtered down to empty.
             export TORCH_CUDA_ARCH_LIST="8.0;8.9"
             DS_BUILD_OPS=1 python -m build --wheel --no-isolation
-            pip install dist/*.whl
+
+            mkdir -p "${{ env.WHEEL_NAS_DIR }}"
+            cp dist/*.whl "${{ env.WHEEL_NAS_DIR }}/"
+            ls -l "${{ env.WHEEL_NAS_DIR }}"
+          namespace: ppu-sched
+          timeout_minutes: 240
+
+      - name: collect wheel from shared NAS
+        run: |
+          set -euo pipefail
+
+          mkdir -p wheelhouse
+          cp "${{ env.WHEEL_NAS_DIR }}"/*.whl wheelhouse/
+          # The NAS copy is only a transfer buffer; the artifact is the durable copy.
+          rm -rf "${{ env.WHEEL_NAS_DIR }}"
+          rmdir "$(dirname "${{ env.WHEEL_NAS_DIR }}")" 2>/dev/null || true
+          ls -l wheelhouse
+
+      - name: upload DeepSpeed wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepspeed-ppu-wheel
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 240
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: download DeepSpeed wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: deepspeed-ppu-wheel
+          path: ${{ runner.temp }}/wheelhouse
+
+      - name: checkin test case (1 PPU)
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: "board-type=ZW-M890P"
+          image: ${{ env.PPU_IMAGE }}
+          artifact_paths: ${{ runner.temp }}/wheelhouse
+          command: |
+            set -eo pipefail
+
+            wget -O /tmp/nccl-sdk.tar.gz "${{ env.NCCL_SDK_URL }}"
+            tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
+            source /usr/local/pccl/envsetup.sh
+
+            # envsetup.sh is not safe under `set -u`, so enable it only afterwards.
+            set -u
+            export NCCL_HOME="${NCCL_HOME:?}"
+            export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+            export LD_LIBRARY_PATH="${NCCL_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+            # tests/conftest.py puts the repo root ahead of site-packages, so the ops
+            # are JIT-built during the run and this pod needs the same toolchain and
+            # nccl.h visibility the build pod had.
+            python -m pip install setuptools wheel ninja
+
+            # The pod does not share the runner host's filesystem, so the host-side
+            # workspace path is not guaranteed to resolve here. Take the first candidate
+            # that actually holds the source instead of testing an unrelated tree.
+            SRC_DIR=""
+            for candidate in "$PWD" "/workspace/source" "${{ github.workspace }}" "$(dirname "${{ github.workspace }}")"; do
+              if [ -f "$candidate/setup.py" ]; then
+                SRC_DIR="$candidate"
+                break
+              fi
+            done
+            if [ -z "$SRC_DIR" ]; then
+              echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
+              exit 1
+            fi
+
+            # Resolve the wheel by globbing, not by `ls`: a glob that matches nothing
+            # makes `ls` fail, and under `set -eo pipefail` that aborts the script
+            # before the explicit message below can run.
+            WHEEL=""
+            for candidate_wheel in "$SRC_DIR"/wheelhouse/*.whl; do
+              if [ -f "$candidate_wheel" ]; then
+                WHEEL="$candidate_wheel"
+                break
+              fi
+            done
+            if [ -z "$WHEEL" ]; then
+              echo "No wheel staged under $SRC_DIR/wheelhouse"
+              exit 1
+            fi
+            pip install "$WHEEL"
 
             # Probe from outside the checkout so the source tree cannot shadow the
             # installed wheel.
@@ -92,4 +201,4 @@ jobs:
               --ignore=unit/v1/nvme/test_gds.py \
               --torch_ver="${TORCH_TEST_VERSION}" --cuda_ver="${CUDA_TEST_VERSION}"
           namespace: ppu-sched
-          timeout_minutes: 420
+          timeout_minutes: 180
