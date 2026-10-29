@@ -1,0 +1,204 @@
+name: ppu-linux-build
+
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PPU_IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
+  NCCL_SDK_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+  WHEEL_NAS_DIR: "/wl_nas/test_framework/${{ github.run_id }}-${{ github.run_attempt }}/wheel"
+
+jobs:
+  build:
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 300
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: build DeepSpeed wheel (1 PPU)
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          image: ${{ env.PPU_IMAGE }}
+          command: |
+            set -eo pipefail
+
+            # Probe the hand-off directory up front: a NAS permission problem must
+            # surface in seconds, not after the multi-hour compile below.
+            mkdir -p "${{ env.WHEEL_NAS_DIR }}"
+            touch "${{ env.WHEEL_NAS_DIR }}/.write-probe"
+            rm -f "${{ env.WHEEL_NAS_DIR }}/.write-probe"
+
+            wget -O /tmp/nccl-sdk.tar.gz "${{ env.NCCL_SDK_URL }}"
+            tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
+            source /usr/local/pccl/envsetup.sh
+
+            set -u
+            export NCCL_HOME="${NCCL_HOME:?}"
+            export NCCL_INCLUDE_DIR="${NCCL_HOME}/include"
+            export NCCL_LIB_DIR="${NCCL_HOME}/lib"
+            export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+            export LD_LIBRARY_PATH="${NCCL_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+            python -m pip install build setuptools wheel ninja
+            git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git /tmp/deepspeed-kernels
+            pip install -v /tmp/deepspeed-kernels
+
+            # The pod does not share the runner host's filesystem, so the host-side
+            # workspace path is not guaranteed to resolve here. Take the first candidate
+            # that actually holds the source instead of building an unrelated tree.
+            SRC_DIR=""
+            for candidate in "$PWD" "/workspace/source" "${{ github.workspace }}" "$(dirname "${{ github.workspace }}")"; do
+              if [ -f "$candidate/setup.py" ]; then
+                SRC_DIR="$candidate"
+                break
+              fi
+            done
+            if [ -z "$SRC_DIR" ]; then
+              echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
+              exit 1
+            fi
+
+            echo "Building DeepSpeed from $SRC_DIR"
+            cd "$SRC_DIR"
+            export DS_BUILD_FP_QUANTIZER=0
+            # The image ships CUDA 13.0, which get_default_compute_capabilities() does
+            # not cover, so the arch list would otherwise be filtered down to empty.
+            export TORCH_CUDA_ARCH_LIST="8.0;8.9"
+            DS_BUILD_OPS=1 python -m build --wheel --no-isolation
+
+            mkdir -p "${{ env.WHEEL_NAS_DIR }}"
+            cp dist/*.whl "${{ env.WHEEL_NAS_DIR }}/"
+            ls -l "${{ env.WHEEL_NAS_DIR }}"
+          namespace: ppu-sched
+          timeout_minutes: 240
+
+      - name: collect wheel from shared NAS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p wheelhouse
+          # The NAS hand-off directory is left in place on purpose: it is written by
+          # the Pod user and the runner has no permission to delete it. The run-id
+          # scoped path keeps each run isolated, and lifecycle is managed on the NAS
+          # side rather than here.
+          cp "${{ env.WHEEL_NAS_DIR }}"/*.whl wheelhouse/
+          ls -l wheelhouse
+
+      - name: upload DeepSpeed wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepspeed-ppu-wheel
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 240
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: download DeepSpeed wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: deepspeed-ppu-wheel
+          path: ${{ runner.temp }}/wheelhouse
+
+      - name: checkin test case (1 PPU)
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: "board-type=ZW-M890P"
+          image: ${{ env.PPU_IMAGE }}
+          artifact_paths: ${{ runner.temp }}/wheelhouse
+          command: |
+            set -eo pipefail
+
+            wget -O /tmp/nccl-sdk.tar.gz "${{ env.NCCL_SDK_URL }}"
+            tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
+            source /usr/local/pccl/envsetup.sh
+
+            # envsetup.sh is not safe under `set -u`, so enable it only afterwards.
+            set -u
+            export NCCL_HOME="${NCCL_HOME:?}"
+            export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+            export LD_LIBRARY_PATH="${NCCL_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+            # tests/conftest.py puts the repo root ahead of site-packages, so the ops
+            # are JIT-built during the run and this pod needs the same toolchain and
+            # nccl.h visibility the build pod had.
+            python -m pip install setuptools wheel ninja
+
+            # The pod does not share the runner host's filesystem, so the host-side
+            # workspace path is not guaranteed to resolve here. Take the first candidate
+            # that actually holds the source instead of testing an unrelated tree.
+            SRC_DIR=""
+            for candidate in "$PWD" "/workspace/source" "${{ github.workspace }}" "$(dirname "${{ github.workspace }}")"; do
+              if [ -f "$candidate/setup.py" ]; then
+                SRC_DIR="$candidate"
+                break
+              fi
+            done
+            if [ -z "$SRC_DIR" ]; then
+              echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
+              exit 1
+            fi
+
+            # Resolve the wheel by globbing, not by `ls`: a glob that matches nothing
+            # makes `ls` fail, and under `set -eo pipefail` that aborts the script
+            # before the explicit message below can run.
+            WHEEL=""
+            for candidate_wheel in "$SRC_DIR"/wheelhouse/*.whl; do
+              if [ -f "$candidate_wheel" ]; then
+                WHEEL="$candidate_wheel"
+                break
+              fi
+            done
+            if [ -z "$WHEEL" ]; then
+              echo "No wheel staged under $SRC_DIR/wheelhouse"
+              exit 1
+            fi
+            pip install "$WHEEL"
+
+            # Probe from outside the checkout so the source tree cannot shadow the
+            # installed wheel.
+            (cd /tmp && python -c "import deepspeed; print(deepspeed.__file__, deepspeed.__version__)")
+
+            pip install "pytest>=7.3.2,<8" "pytest-xdist==3.3.1" "pytest-forked>=1.6"
+            export TORCH_TEST_VERSION=2.13.0
+            export CUDA_TEST_VERSION=13.0
+            cd "$SRC_DIR/tests"
+            # GDS tests need GPUDirect Storage support, unavailable on these nodes
+            pytest -n 4 --forked --verbose unit/v1/ \
+              --ignore=unit/v1/nvme/test_gds.py \
+              --torch_ver="${TORCH_TEST_VERSION}" --cuda_ver="${CUDA_TEST_VERSION}"
+            pytest --verbose -m 'sequential' unit/v1/ \
+              --ignore=unit/v1/nvme/test_gds.py \
+              --torch_ver="${TORCH_TEST_VERSION}" --cuda_ver="${CUDA_TEST_VERSION}"
+          namespace: ppu-sched
+          timeout_minutes: 180
