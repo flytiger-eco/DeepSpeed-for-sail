@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     runs-on: k8s-runner-group-cpu-flytiger
-    timeout-minutes: 360
+    timeout-minutes: 480
     container:
       image: ghcr.io/actions/actions-runner:latest
 
@@ -28,7 +28,7 @@ jobs:
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           nnodes: 0
-          nproc_per_node: 1
+          nproc_per_node: 2
           node_selector: "board-type=ZW-M890P"
           image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
           command: |
@@ -44,14 +44,77 @@ jobs:
             git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git /tmp/deepspeed-kernels
             pip install -v /tmp/deepspeed-kernels
 
-            # The cluster pod starts in its own working directory, so the build has to
-            # move into the checkout actions/checkout produced. Fail fast if that path
-            # is not visible inside the pod instead of building an unrelated tree.
-            cd "${{ github.workspace }}" || exit 1
-            test -f setup.py || { echo "DeepSpeed source not found in ${{ github.workspace }}"; exit 1; }
+            # The pod does not share the runner host's filesystem, so the host-side
+            # workspace path is not guaranteed to resolve here. Take the first candidate
+            # that actually holds the source instead of building an unrelated tree.
+            SRC_DIR=""
+            for candidate in "$PWD" "/workspace/source" "${{ github.workspace }}" "$(dirname "${{ github.workspace }}")"; do
+              if [ -f "$candidate/setup.py" ]; then
+                SRC_DIR="$candidate"
+                break
+              fi
+            done
+            if [ -z "$SRC_DIR" ]; then
+              echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
+              exit 1
+            fi
+            echo "Building DeepSpeed from $SRC_DIR"
+            cd "$SRC_DIR" || exit 1
             export DS_BUILD_FP_QUANTIZER=0
             export TORCH_CUDA_ARCH_LIST="8.0;8.9"
             DS_BUILD_OPS=1 python -m build --wheel --no-isolation
             pip install dist/*.whl
           namespace: ppu-sched
           timeout_minutes: 240
+
+      - name: checkin test case
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: "board-type=ZW-M890P"
+          image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
+          command: |
+            set -eo pipefail
+
+            if [ ! -f /usr/local/pccl/envsetup.sh ]; then
+              wget -O /tmp/nccl-sdk.tar.gz https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
+              tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
+            fi
+            source /usr/local/pccl/envsetup.sh
+
+            set -u
+            export LD_LIBRARY_PATH="${NCCL_HOME:?}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+            SRC_DIR=""
+            for candidate in "$PWD" "/workspace/source" "${{ github.workspace }}" "$(dirname "${{ github.workspace }}")"; do
+              if [ -f "$candidate/setup.py" ]; then
+                SRC_DIR="$candidate"
+                break
+              fi
+            done
+            if [ -z "$SRC_DIR" ]; then
+              echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
+              exit 1
+            fi
+
+            # Probe from outside the checkout so the source tree cannot shadow the
+            # installed wheel, and reinstall it when this pod has no DeepSpeed yet.
+            if ! (cd /tmp && python -c "import deepspeed") >/dev/null 2>&1; then
+              pip install "$SRC_DIR"/dist/*.whl
+            fi
+            python -c "import deepspeed; print(deepspeed.__file__, deepspeed.__version__)"
+
+            pip install "pytest>=7.3.2,<8" "pytest-xdist==3.3.1" "pytest-forked>=1.6"
+            export TORCH_TEST_VERSION=2.13.0
+            export CUDA_TEST_VERSION=13.0
+            cd "$SRC_DIR/tests"
+            # GDS tests need GPUDirect Storage support, unavailable on these nodes
+            pytest -n 4 --forked --verbose unit/v1/ \
+              --ignore=unit/v1/nvme/test_gds.py \
+              --torch_ver="${TORCH_TEST_VERSION:?}" --cuda_ver="${CUDA_TEST_VERSION:?}"
+            pytest --verbose -m 'sequential' unit/v1/ \
+              --ignore=unit/v1/nvme/test_gds.py \
+              --torch_ver="${TORCH_TEST_VERSION:?}" --cuda_ver="${CUDA_TEST_VERSION:?}"
+          namespace: ppu-sched
+          timeout_minutes: 180
