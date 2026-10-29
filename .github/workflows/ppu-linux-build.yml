@@ -24,7 +24,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: build DeepSpeed wheel (1 PPU)
+      # Build and test must stay in one cluster-task step: each step gets a fresh
+      # pod with no shared volume, so a wheel built in one step is gone in the next.
+      - name: build DeepSpeed wheel and run checkin tests (1 PPU)
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           nnodes: 0
@@ -32,14 +34,20 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
           command: |
+            set -eo pipefail
+
             wget -O /tmp/nccl-sdk.tar.gz https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
             tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
-            ENVSETUP="/usr/local/pccl/envsetup.sh"
-            source "$ENVSETUP"
-            export NCCL_HOME
+            source /usr/local/pccl/envsetup.sh
+
+            # envsetup.sh is not safe under `set -u`, so enable it only afterwards.
+            set -u
+            export NCCL_HOME="${NCCL_HOME:?}"
             export NCCL_INCLUDE_DIR="${NCCL_HOME}/include"
             export NCCL_LIB_DIR="${NCCL_HOME}/lib"
             export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+            export LD_LIBRARY_PATH="${NCCL_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
             python -m pip install build setuptools wheel ninja
             git clone --recurse-submodules https://github.com/deepspeedai/deepspeed-kernels.git /tmp/deepspeed-kernels
             pip install -v /tmp/deepspeed-kernels
@@ -58,52 +66,19 @@ jobs:
               echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
               exit 1
             fi
+
             echo "Building DeepSpeed from $SRC_DIR"
-            cd "$SRC_DIR" || exit 1
+            cd "$SRC_DIR"
             export DS_BUILD_FP_QUANTIZER=0
+            # The image ships CUDA 13.0, which get_default_compute_capabilities() does
+            # not cover, so the arch list would otherwise be filtered down to empty.
             export TORCH_CUDA_ARCH_LIST="8.0;8.9"
             DS_BUILD_OPS=1 python -m build --wheel --no-isolation
             pip install dist/*.whl
-          namespace: ppu-sched
-          timeout_minutes: 240
-
-      - name: checkin test case
-        uses: flytiger-eco/shared-workflows/cluster-task@main
-        with:
-          nnodes: 0
-          nproc_per_node: 2
-          node_selector: "board-type=ZW-M890P"
-          image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
-          command: |
-            set -eo pipefail
-
-            if [ ! -f /usr/local/pccl/envsetup.sh ]; then
-              wget -O /tmp/nccl-sdk.tar.gz https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
-              tar -xzf /tmp/nccl-sdk.tar.gz -C /usr/local
-            fi
-            source /usr/local/pccl/envsetup.sh
-
-            set -u
-            export LD_LIBRARY_PATH="${NCCL_HOME:?}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-
-            SRC_DIR=""
-            for candidate in "$PWD" "/workspace/source" "${{ github.workspace }}" "$(dirname "${{ github.workspace }}")"; do
-              if [ -f "$candidate/setup.py" ]; then
-                SRC_DIR="$candidate"
-                break
-              fi
-            done
-            if [ -z "$SRC_DIR" ]; then
-              echo "DeepSpeed source not found (tried: $PWD, /workspace/source, ${{ github.workspace }})"
-              exit 1
-            fi
 
             # Probe from outside the checkout so the source tree cannot shadow the
-            # installed wheel, and reinstall it when this pod has no DeepSpeed yet.
-            if ! (cd /tmp && python -c "import deepspeed") >/dev/null 2>&1; then
-              pip install "$SRC_DIR"/dist/*.whl
-            fi
-            python -c "import deepspeed; print(deepspeed.__file__, deepspeed.__version__)"
+            # installed wheel.
+            (cd /tmp && python -c "import deepspeed; print(deepspeed.__file__, deepspeed.__version__)")
 
             pip install "pytest>=7.3.2,<8" "pytest-xdist==3.3.1" "pytest-forked>=1.6"
             export TORCH_TEST_VERSION=2.13.0
@@ -112,9 +87,9 @@ jobs:
             # GDS tests need GPUDirect Storage support, unavailable on these nodes
             pytest -n 4 --forked --verbose unit/v1/ \
               --ignore=unit/v1/nvme/test_gds.py \
-              --torch_ver="${TORCH_TEST_VERSION:?}" --cuda_ver="${CUDA_TEST_VERSION:?}"
+              --torch_ver="${TORCH_TEST_VERSION}" --cuda_ver="${CUDA_TEST_VERSION}"
             pytest --verbose -m 'sequential' unit/v1/ \
               --ignore=unit/v1/nvme/test_gds.py \
-              --torch_ver="${TORCH_TEST_VERSION:?}" --cuda_ver="${CUDA_TEST_VERSION:?}"
+              --torch_ver="${TORCH_TEST_VERSION}" --cuda_ver="${CUDA_TEST_VERSION}"
           namespace: ppu-sched
-          timeout_minutes: 180
+          timeout_minutes: 420
